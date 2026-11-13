@@ -2,9 +2,9 @@
 """Forecast Roblox's Up-and-Coming top 10 for make.fun bounty
 roblox-up-and-coming-forecast-01. v3 (see BUILD_NOTES.md).
 
-Method: a STACK of two independently fitted forecasters, blended
-0.9 / 0.1 in probability space (weights chosen on the practice split
-and the Nov-4 split, best of a coarse grid, flat optimum):
+Method: a STACK of three independently fitted forecasters, blended
+0.80 / 0.18 / 0.02 in probability space (weights chosen on the practice
+split and the Nov-4 split):
 
   (A) Monte Carlo rank simulation (the v2 engine, unchanged):
       each game has a latent rank-value that mean-reverts toward a
@@ -25,12 +25,15 @@ and the Nov-4 split, best of a coarse grid, flat optimum):
 
 The stack keeps the MC's honest spread (the log score punishes
 confident wrong calls far more than it rewards confident right ones)
-while the fitted table sharpens the drift path slightly toward the
-measured top-10 sinking behaviour. A pure static occupancy table was
-tested and REJECTED: it gets the top-10 set mostly right but the
-places wrong, and its near-one-hot probabilities score -50..-76.
-The Gaussian table alone scores -34.5/-38.6; the stack scores
--33.43/-37.69, beating v2 (-33.54/-37.88) on both splits.
+while the fitted Gaussian table sharpens the drift path slightly
+toward the measured top-10 sinking behaviour, and the empirical
+practice table (recency-weighted, place-kernel smoothed, small drift
+shift; weight 0.02) sharpens the top-10 set further. A pure static
+occupancy table was tested and REJECTED: it gets the top-10 set
+mostly right but the places wrong, and its near-one-hot probabilities
+score -50..-76. The Gaussian table alone scores -34.5/-38.6; the
+3-way stack scores -32.98/-37.54, beating the 2-way stack
+(-33.44/-37.69) and v2 (-33.54/-37.88) on both splits.
 
 Stdlib only. Reads $MAKEFUN_INPUT_DIR (default /input), writes
 $MAKEFUN_OUTPUT_DIR (default /output)/<task.output>.
@@ -62,8 +65,17 @@ GAUSS_TEMP = 2.0
 GAUSS_UNNAMED = 0.15
 GAUSS_VEL_SHRINK = 0.1
 GAUSS_HOUR_STEP = 2     # evaluate every 2nd hour, time-averaged
-STACK_W_MC = 0.9
-STACK_W_GAUSS = 0.1
+# ---- component C: fitted practice table ----
+TABLE_HALF_LIFE_H = 36.0
+TABLE_SIGMA_PLACE = 3.5
+TABLE_TEMP = 1.0
+TABLE_UNNAMED = 0.35
+TABLE_DRIFT_SHRINK = 0.10
+
+# ---- stack weights (fixed; see header note on self-calibration) ----
+STACK_W_MC = 0.80
+STACK_W_GAUSS = 0.18
+STACK_W_TABLE = 0.02
 
 # fitted lag regressions (measured on the practice archive):
 # rank<=10: E[r(t+h)] = s(h)*r0 + b(h), resid sd rs(h)
@@ -381,17 +393,80 @@ def gauss_forecast(games, t0, hours, last_chart_uids):
     return {"probabilities": rows, "top10": top10[:10]}
 
 
-def stack_forecasts(mc_fc, gauss_fc, last_chart_uids):
-    """Convex blend of the two component forecasts in probability space."""
+# ---- component C: fitted practice table ----
+
+def table_forecast(snaps, games, last_chart_uids):
+    """Empirical per-place occupancy table with place-kernel smoothing
+    and a small drift shift. Returns a forecast dict like the others."""
+    t_end = parse_time(snaps[-1]["at"])
+    vel = {g["uid"]: g["v"] for g in games}
+    counts = {k: {} for k in range(1, 11)}
+    koff = range(-6, 7)
+    for r in snaps:
+        age = (t_end - parse_time(r["at"])).total_seconds() / 3600.0
+        w = 0.5 ** (age / TABLE_HALF_LIFE_H) if TABLE_HALF_LIFE_H else 1.0
+        for g in r.get("up_and_coming") or []:
+            if g["rank"] > 10:
+                continue
+            uid = g["universe_id"]
+            centre = g["rank"] + TABLE_DRIFT_SHRINK * vel.get(uid, 0.0) * 36.0
+            for off in koff:
+                pl = g["rank"] + off
+                if pl < 1 or pl > 10:
+                    continue
+                kw = math.exp(-0.5 * ((pl - centre) / TABLE_SIGMA_PLACE) ** 2)
+                if kw <= 0.01:
+                    continue
+                d = counts[pl]
+                d[uid] = d.get(uid, 0.0) + w * kw
+    rows = []
+    for place in range(1, 11):
+        d = counts[place]
+        tot = sum(d.values())
+        if tot <= 0:
+            continue
+        items = [(uid, (c / tot) ** TABLE_TEMP) for uid, c in d.items()]
+        s = sum(p for _, p in items)
+        items.sort(key=lambda t: -t[1])
+        for uid, p in items[:MAX_ROWS_PER_PLACE]:
+            pp = p / s * (1.0 - TABLE_UNNAMED)
+            if pp >= 0.0005:
+                rows.append({"universe_id": uid, "place": place,
+                             "p": round(pp, 6)})
+    cand = sorted(((r["p"], r["universe_id"], r["place"]) for r in rows),
+                  reverse=True)
+    used_g, used_p, top = set(), set(), {}
+    for p, uid, place in cand:
+        if uid in used_g or place in used_p:
+            continue
+        used_g.add(uid)
+        used_p.add(place)
+        top[place] = uid
+        if len(top) == 10:
+            break
+    top10 = [top[k] for k in sorted(top)]
+    for uid in last_chart_uids:
+        if len(top10) >= 10:
+            break
+        if uid not in top10:
+            top10.append(uid)
+    return {"probabilities": rows, "top10": top10[:10]}
+
+
+def stack_forecasts(mc_fc, gauss_fc, table_fc, last_chart_uids):
+    """Convex blend of the three component forecasts in probability space."""
     def to_map(fc):
         return {(r["universe_id"], r["place"]): r["p"]
                 for r in fc["probabilities"]}
 
     mm = to_map(mc_fc)
     gm = to_map(gauss_fc)
+    tm = to_map(table_fc)
     comb = {}
-    for k in set(mm) | set(gm):
-        comb[k] = STACK_W_MC * mm.get(k, 0.0) + STACK_W_GAUSS * gm.get(k, 0.0)
+    for k in set(mm) | set(gm) | set(tm):
+        comb[k] = (STACK_W_MC * mm.get(k, 0.0)
+                   + STACK_W_GAUSS * gm.get(k, 0.0)
+                   + STACK_W_TABLE * tm.get(k, 0.0))
     rows = []
     for place in range(1, 11):
         items = [(uid, p) for (uid, pl), p in comb.items() if pl == place]
@@ -435,7 +510,8 @@ def main():
     probs, _unnamed = simulate(games, t0, n_chart, hours, rng)
     mc_fc = build_forecast(probs, last_uids)
     gauss_fc = gauss_forecast(games, t0, hours, last_uids)
-    forecast = stack_forecasts(mc_fc, gauss_fc, last_uids)
+    table_fc = table_forecast(snaps, games, last_uids)
+    forecast = stack_forecasts(mc_fc, gauss_fc, table_fc, last_uids)
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, task.get("output", "forecast.json"))
     with open(out_path, "w") as f:
